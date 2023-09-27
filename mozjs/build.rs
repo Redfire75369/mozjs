@@ -8,18 +8,27 @@ use std::path::PathBuf;
 fn cc_flags(bindgen: bool) -> Vec<&'static str> {
     let mut result = vec!["-DSTATIC_JS_API"];
 
+    let target = env::var("TARGET").unwrap();
+    let windows = target.contains("windows");
+
     if env::var("CARGO_FEATURE_DEBUGMOZJS").is_ok() {
         result.push("-DDEBUG");
 
         // bindgen doesn't like this
         if !bindgen {
-            if cfg!(target_os = "windows") {
+            if windows {
                 result.push("-Od");
             } else {
                 result.push("-g");
                 result.push("-O0");
             }
         }
+    }
+
+    if windows && !bindgen {
+        result.push("-std:c++17");
+    } else {
+        result.push("-std=c++17");
     }
 
     if env::var("CARGO_FEATURE_PROFILEMOZJS").is_ok() {
@@ -35,63 +44,63 @@ fn cc_flags(bindgen: bool) -> Vec<&'static str> {
 }
 
 fn main() {
-    //let mut build = cxx_build::bridge("src/jsglue.rs"); // returns a cc::Build;
     let mut build = cc::Build::new();
-    let outdir = env::var("DEP_MOZJS_OUTDIR").unwrap();
-    let include_path: PathBuf = [&outdir, "dist", "include"].iter().collect();
+    build.cpp(true).file("src/jsglue.cpp");
 
-    build
-        .cpp(true)
-        .file("src/jsglue.cpp")
-        .include(&include_path);
+    let outdir = PathBuf::from(env::var("DEP_MOZJS_OUTDIR").unwrap());
+
+    build.include(outdir.join("dist/include"));
+
     for flag in cc_flags(false) {
         build.flag_if_supported(flag);
     }
 
-    let confdefs_path: PathBuf = [&outdir, "js", "src", "js-confdefs.h"].iter().collect();
-    let msvc = if build.get_compiler().is_like_msvc() {
-        build.flag(&format!("-FI{}", confdefs_path.to_string_lossy()));
+    let confdefs_path = outdir.join("js/src/js-confdefs.h");
+    let confdefs = confdefs_path.to_str().expect("UTF-8");
+
+    if build.get_compiler().is_like_msvc() {
         build.define("WIN32", "");
         build.flag("-Zi");
         build.flag("-GR-");
-        build.flag("-std:c++17");
+        build.flag(&format!("-FI{}", confdefs));
         true
     } else {
         build.flag("-fPIC");
         build.flag("-fno-rtti");
-        build.flag("-std=c++17");
         build.flag("-include");
-        build.flag(&confdefs_path.to_string_lossy());
+        build.flag(confdefs);
         false
     };
 
     build.compile("jsglue");
+
     println!("cargo:rerun-if-changed=src/jsglue.cpp");
     let mut builder = bindgen::Builder::default()
         .header("./src/jsglue.cpp")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks))
         .size_t_is_usize(true)
-        .formatter(bindgen::Formatter::Rustfmt)
-        .clang_arg("-x")
-        .clang_arg("c++")
-        .clang_args(cc_flags(true))
-        .clang_args(["-I", &include_path.to_string_lossy()])
         .enable_cxx_namespaces()
-        .allowlist_file("./src/jsglue.cpp")
-        .allowlist_recursively(false);
+        .formatter(bindgen::Formatter::Rustfmt);
 
-    if msvc {
-        builder = builder.clang_args([
-            "-fms-compatibility",
-            &format!("-FI{}", confdefs_path.to_string_lossy()),
-            "-DWIN32",
-            "-std=c++17",
-        ])
-    } else {
-        builder = builder
-            .clang_args(["-fPIC", "-fno-rtti", "-std=c++17"])
-            .clang_args(["-include", &confdefs_path.to_str().expect("UTF-8")])
+    builder = builder.clang_args(["-x", "c++"]);
+
+    let target = env::var("TARGET").unwrap();
+    if target.contains("windows") {
+        builder = builder.clang_arg("-fms-compatibility");
     }
+
+    builder = builder.clang_args(cc_flags(true));
+
+    builder = builder.clang_args(["-I", &outdir.join("dist/include").to_str().expect("UTF-8")]);
+
+    builder = if target.contains("windows") {
+        builder.clang_arg("-DWIN32")
+            .clang_arg(format!("-FI{}", confdefs))
+    } else {
+        builder.clang_arg("-fPIC")
+            .clang_arg("-fno-rtti")
+            .clang_args(["-include", confdefs])
+    };
 
     for ty in BLACKLIST_TYPES {
         builder = builder.blocklist_type(ty);
@@ -104,11 +113,15 @@ fn main() {
     for &(module, raw_line) in MODULE_RAW_LINES {
         builder = builder.module_raw_line(module, raw_line);
     }
+
+    builder = builder.allowlist_file("./src/jsglue.cpp")
+        .allowlist_recursively(false);
+
     let bindings = builder
         .generate()
         .expect("Unable to generate bindings to jsglue");
 
-    // Write the bindings to the $OUT_DIR/bindings.rs file.
+    // Write the bindings to the $OUT_DIR/gluebindings.rs file.
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("gluebindings.rs");
     bindings
         .write_to_file(out_path)

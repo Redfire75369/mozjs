@@ -95,7 +95,7 @@ fn find_make() -> OsString {
     }
 }
 
-fn cc_flags() -> Vec<&'static str> {
+fn cc_flags(bindgen: bool) -> Vec<&'static str> {
     let mut result = vec!["-DRUST_BINDGEN", "-DSTATIC_JS_API"];
 
     if env::var_os("CARGO_FEATURE_DEBUGMOZJS").is_some() {
@@ -103,24 +103,31 @@ fn cc_flags() -> Vec<&'static str> {
     }
 
     let target = env::var("TARGET").unwrap();
-    if target.contains("windows") {
-        result.extend(&[
-            "-std=c++17",
-            "-DWIN32",
-            // Don't use reinterpret_cast() in offsetof(),
-            // since it's not a constant expression, so can't
-            // be used in static_assert().
-            "-D_CRT_USE_BUILTIN_OFFSETOF",
-        ]);
+    let windows = target.contains("windows");
+
+    if windows {
+        if bindgen {
+            result.push("-std=c++17");
+        } else {
+            result.push("-std:c++17");
+        }
+
+        // Don't use reinterpret_cast() in offsetof(),
+        // since it's not a constant expression, so can't
+        // be used in static_assert().
+        result.push("-D_CRT_USE_BUILTIN_OFFSETOF");
     } else {
         result.extend(&[
             "-std=gnu++17",
             "-fno-sized-deallocation",
-            "-Wno-unused-parameter",
-            "-Wno-invalid-offsetof",
-            "-Wno-unused-private-field",
         ]);
     }
+
+    result.extend(&[
+        "-Wno-unused-parameter",
+        "-Wno-invalid-offsetof",
+        "-Wno-unused-private-field",
+    ]);
 
     let is_apple = target.contains("apple");
     let is_freebsd = target.contains("freebsd");
@@ -202,14 +209,14 @@ fn build_jsapi(build_dir: &Path) {
 
     let encoding_c_mem_include_dir = env::var("DEP_ENCODING_C_MEM_INCLUDE_DIR").unwrap();
     let mut cppflags = OsString::from("-I");
-    cppflags.push(OsString::from(
-        encoding_c_mem_include_dir.replace("\\", "/"),
-    ));
+    cppflags.push(encoding_c_mem_include_dir.replace("\\", "/"));
     cppflags.push(" ");
+
     // add zlib from libz-sys to include path
     if let Ok(zlib_include_dir) = env::var("DEP_Z_INCLUDE") {
         cppflags.push(format!("-I{} ", zlib_include_dir.replace("\\", "/")));
     }
+
     // add zlib.pc into pkg-config's search path
     // this is only needed when libz-sys builds zlib from source
     if let Ok(zlib_root_dir) = env::var("DEP_Z_ROOT") {
@@ -223,6 +230,7 @@ fn build_jsapi(build_dir: &Path) {
         }
         cmd.env("PKG_CONFIG_PATH", pkg_config_path);
     }
+
     cppflags.push(env::var_os("CPPFLAGS").unwrap_or_default());
     cmd.env("CPPFLAGS", cppflags);
 
@@ -235,14 +243,15 @@ fn build_jsapi(build_dir: &Path) {
     }
 
     let cargo_manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let result = cmd
-        .args(&["-R", "-f"])
-        .arg(cargo_manifest_dir.join("makefile.cargo"))
-        .current_dir(&build_dir)
+
+    cmd.arg("-R")
+        .args(&[PathBuf::from("-f"), cargo_manifest_dir.join("makefile.cargo")]);
+
+    cmd.current_dir(&build_dir)
         .env("SRC_DIR", &cargo_manifest_dir.join("mozjs"))
-        .env("NO_RUST_PANIC_HOOK", "1")
-        .status()
-        .expect(&format!("Failed to run `{:?}`", make));
+        .env("NO_RUST_PANIC_HOOK", "1");
+
+    let result = cmd.status().expect(&format!("Failed to run `{:?}`", make));
     assert!(result.success());
 
     println!(
@@ -271,25 +280,31 @@ fn build_jsapi(build_dir: &Path) {
 
 fn build_jsglue(build_dir: &Path) {
     let mut build = cc::Build::new();
-    build.cpp(true);
+    build.cpp(true).file("src/jsglue.cpp");
 
-    for flag in cc_flags() {
+    build
+        .include(build_dir.join("dist/include"))
+        .include(build_dir.join("js/src"));
+
+    for flag in cc_flags(false) {
         build.flag_if_supported(flag);
     }
 
-    let config = format!("{}/js/src/js-confdefs.h", build_dir.display());
+    let confdefs_path = build_dir.join("js/src/js-confdefs.h");
+    let confdefs = confdefs_path.to_str().expect("UTF-8");
+
     if build.get_compiler().is_like_msvc() {
-        build.flag_if_supported("-std:c++17");
-        build.flag("-FI");
+        build.define("WIN32", "");
+        build.flag("-GR-");
+        build.flag(&format!("-FI{}", confdefs));
     } else {
-        build.flag("-std=c++17");
+        build.flag("-fPIC");
+        build.flag("-fno-rtti");
         build.flag("-include");
+        build.flag(&confdefs);
     }
+
     build
-        .flag(&config)
-        .file("src/jsglue.cpp")
-        .include(build_dir.join("dist/include"))
-        .include(build_dir.join("js/src"))
         .out_dir(build_dir.join("glue"))
         .compile("jsglue");
 }
@@ -318,13 +333,9 @@ fn build_jsapi_bindings(build_dir: &Path) {
         .size_t_is_usize(true)
         .enable_cxx_namespaces()
         .with_codegen_config(config)
-        .formatter(Formatter::Rustfmt)
-        .clang_arg("-I")
-        .clang_arg(build_dir.join("dist/include").to_str().expect("UTF-8"))
-        .clang_arg("-I")
-        .clang_arg(build_dir.join("js/src").to_str().expect("UTF-8"))
-        .clang_arg("-x")
-        .clang_arg("c++");
+        .formatter(Formatter::Rustfmt);
+
+    builder = builder.clang_args(["-x", "c++"]);
 
     let target = env::var("TARGET").unwrap();
     if target.contains("windows") {
@@ -343,17 +354,22 @@ fn build_jsapi_bindings(build_dir: &Path) {
         }
     }
 
-    for flag in cc_flags() {
-        builder = builder.clang_arg(flag);
-    }
+    builder = builder.clang_args(cc_flags(true));
 
-    builder = builder.clang_arg("-include");
-    builder = builder.clang_arg(
-        build_dir
-            .join("js/src/js-confdefs.h")
-            .to_str()
-            .expect("UTF-8"),
-    );
+    builder = builder.clang_args(["-I", build_dir.join("dist/include").to_str().expect("UTF-8")])
+        .clang_args(["-I", build_dir.join("js/src").to_str().expect("UTF-8")]);
+
+    let confdefs_path = build_dir.join("js/src/js-confdefs.h");
+    let confdefs = confdefs_path.to_str().expect("UTF-8");
+
+    builder = if target.contains("windows") {
+        builder.clang_arg("-DWIN32")
+            .clang_arg(format!("-FI{}", confdefs))
+    } else {
+        builder.clang_arg("-fPIC")
+            .clang_arg("-fno-rtti")
+            .clang_args(["-include", confdefs])
+    };
 
     println!(
         "Generating bindings {:?} {}.",
@@ -381,12 +397,12 @@ fn build_jsapi_bindings(build_dir: &Path) {
         builder = builder.blocklist_function(func);
     }
 
-    for ty in OPAQUE_TYPES {
-        builder = builder.opaque_type(ty);
-    }
-
     for ty in BLACKLIST_TYPES {
         builder = builder.blocklist_type(ty);
+    }
+
+    for ty in OPAQUE_TYPES {
+        builder = builder.opaque_type(ty);
     }
 
     for &(module, raw_line) in MODULE_RAW_LINES {
@@ -510,7 +526,7 @@ const BLACKLIST_TYPES: &'static [&'static str] = &[
     "JS::MutableHandleVector",
     "JS::Rooted.*Vector",
     "JS::RootedValueArray",
-    // Classes we don't use and we cannot generate theri
+    // Classes we don't use and we cannot generate their
     // types properly from bindgen so we'll skip them for now.
     "JS::dbg::Builder",
     "JS::dbg::Builder_BuiltThing",
