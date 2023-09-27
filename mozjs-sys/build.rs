@@ -30,14 +30,9 @@ const ENV_VARS: &'static [&'static str] = &[
 
 const EXTRA_FILES: &'static [&'static str] = &[
     "makefile.cargo",
-    "src/rustfmt.toml",
     "src/jsglue.hpp",
     "src/jsglue.cpp",
 ];
-
-/// Which version of moztools we expect
-#[cfg(windows)]
-const MOZTOOLS_VERSION: &str = "4.0";
 
 fn main() {
     // https://github.com/servo/mozjs/issues/113
@@ -49,14 +44,24 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let build_dir = out_dir.join("build");
 
+    let include_dir = build_dir.join("dist/include");
+    let src_dir = build_dir.join("js/src");
+    let confdefs_path = src_dir.join("js-confdefs.h");
+
+    let include_dir = include_dir.to_str().expect("UTF-8");
+    let src_dir = src_dir.to_str().expect("UTF-8");
+    let confdefs = confdefs_path.to_str().expect("UTF-8");
+
+    let target = env::var("TARGET").unwrap();
+
     // Used by mozjs downstream, don't remove.
     println!("cargo:outdir={}", build_dir.display());
 
     fs::create_dir_all(&build_dir).expect("could not create build dir");
 
     build_jsapi(&build_dir);
-    build_jsglue(&build_dir);
-    build_jsapi_bindings(&build_dir);
+    build_jsglue(include_dir, src_dir, confdefs, &target);
+    build_jsapi_bindings(include_dir, src_dir, confdefs, &target);
 
     if env::var_os("MOZJS_FORCE_RERUN").is_none() {
         for var in ENV_VARS {
@@ -95,15 +100,15 @@ fn find_make() -> OsString {
     }
 }
 
-fn cc_flags(bindgen: bool) -> Vec<&'static str> {
+fn cc_flags(target: &str, bindgen: bool) -> Vec<&'static str> {
     let mut result = vec!["-DRUST_BINDGEN", "-DSTATIC_JS_API"];
 
     if env::var_os("CARGO_FEATURE_DEBUGMOZJS").is_some() {
         result.extend(&["-DJS_GC_ZEAL", "-DDEBUG", "-DJS_DEBUG"]);
     }
 
-    let target = env::var("TARGET").unwrap();
     let windows = target.contains("windows");
+    let msvc = windows && !bindgen;
 
     if windows {
         if bindgen {
@@ -117,22 +122,27 @@ fn cc_flags(bindgen: bool) -> Vec<&'static str> {
         // be used in static_assert().
         result.push("-D_CRT_USE_BUILTIN_OFFSETOF");
     } else {
-        result.extend(&[
-            "-std=gnu++17",
-            "-fno-sized-deallocation",
-        ]);
+        result.push("-std=gnu++17");
     }
 
-    result.extend(&[
-        "-Wno-unused-parameter",
-        "-Wno-invalid-offsetof",
-        "-Wno-unused-private-field",
-    ]);
+    if msvc {
+        result.push("-Zi");
+        result.push("-GR-");
+    } else {
+        result.push("-fno-rtti");
+        result.push("-fno-sized-deallocation");
 
-    let is_apple = target.contains("apple");
-    let is_freebsd = target.contains("freebsd");
+        if !windows {
+            result.push("-fms-compatibility");
+            result.push("-fPIC");
+        }
+    }
 
-    if is_apple || is_freebsd {
+    result.push("-Wno-invalid-offsetof");
+    result.push("-Wno-unused-parameter");
+    result.push("-Wno-unused-private-field");
+
+    if target.contains("apple") || target.contains("freebsd") {
         result.push("-stdlib=libc++");
     }
 
@@ -149,14 +159,17 @@ fn cargo_target_dir() -> PathBuf {
         }
         dir = target_dir;
     }
-    panic!("$OUT_DIR is not in target")
+    panic!("%OUT_DIR% is not in target")
 }
+
+/// Which version of moztools we expect
+#[cfg(windows)]
+const MOZTOOLS_VERSION: &str = "4.0";
 
 #[cfg(windows)]
 fn find_moztools() -> Option<PathBuf> {
     let cargo_target_dir = cargo_target_dir();
-    let deps_dir = cargo_target_dir.join("dependencies");
-    let moztools_path = deps_dir.join("moztools").join(MOZTOOLS_VERSION);
+    let moztools_path = cargo_target_dir.join("dependencies/moztools").join(MOZTOOLS_VERSION);
 
     if moztools_path.exists() {
         Some(moztools_path)
@@ -188,8 +201,9 @@ fn build_jsapi(build_dir: &Path) {
                 Follow instructions on: https://github.com/servo/mozjs?tab=readme-ov-file#windows"
             );
         };
+
         let mut paths = Vec::new();
-        paths.push(moztools.join("msys2").join("usr").join("bin"));
+        paths.push(moztools.join("msys2/usr/bin"));
         paths.push(moztools.join("bin"));
         paths.extend(env::split_paths(&env::var_os("PATH").unwrap()));
         env::set_var("PATH", &env::join_paths(paths).unwrap());
@@ -205,7 +219,7 @@ fn build_jsapi(build_dir: &Path) {
         make = find_make();
     }
 
-    let mut cmd = Command::new(make.clone());
+    let mut cmd = Command::new(&make);
 
     let encoding_c_mem_include_dir = env::var("DEP_ENCODING_C_MEM_INCLUDE_DIR").unwrap();
     let mut cppflags = OsString::from("-I");
@@ -245,7 +259,7 @@ fn build_jsapi(build_dir: &Path) {
     let cargo_manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
 
     cmd.arg("-R")
-        .args(&[PathBuf::from("-f"), cargo_manifest_dir.join("makefile.cargo")]);
+        .args(&["-f", cargo_manifest_dir.join("makefile.cargo").to_str().expect("UTF-8")]);
 
     cmd.current_dir(&build_dir)
         .env("SRC_DIR", &cargo_manifest_dir.join("mozjs"))
@@ -278,34 +292,29 @@ fn build_jsapi(build_dir: &Path) {
     }
 }
 
-fn build_jsglue(build_dir: &Path) {
+fn build_jsglue(include_dir: &str, src_dir: &str, confdefs: &str, target: &str) {
     let mut build = cc::Build::new();
     build.cpp(true).file("src/jsglue.cpp");
 
     build
-        .include(build_dir.join("dist/include"))
-        .include(build_dir.join("js/src"));
+        .include(include_dir)
+        .include(src_dir);
 
-    for flag in cc_flags(false) {
-        build.flag_if_supported(flag);
+    for flag in cc_flags(target, false) {
+        build.flag(flag);
     }
-
-    let confdefs_path = build_dir.join("js/src/js-confdefs.h");
-    let confdefs = confdefs_path.to_str().expect("UTF-8");
 
     if build.get_compiler().is_like_msvc() {
         build.define("WIN32", "");
-        build.flag("-GR-");
         build.flag(&format!("-FI{}", confdefs));
     } else {
-        build.flag("-fPIC");
-        build.flag("-fno-rtti");
         build.flag("-include");
         build.flag(&confdefs);
     }
 
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("build").join("glue");
     build
-        .out_dir(build_dir.join("glue"))
+        .out_dir(out_path)
         .compile("jsglue");
 }
 
@@ -314,7 +323,7 @@ fn build_jsglue(build_dir: &Path) {
 ///
 /// To add or remove which functions, types, and variables get bindings
 /// generated, see the `const` configuration variables below.
-fn build_jsapi_bindings(build_dir: &Path) {
+fn build_jsapi_bindings(include_dir: &str, src_dir: &str, confdefs: &str, target: &str) {
     // By default, constructors, destructors and methods declared in .h files are inlined,
     // so their symbols aren't available. Adding the -fkeep-inlined-functions option
     // causes the jsapi library to bloat from 500M to 6G, so that's not an option.
@@ -337,11 +346,6 @@ fn build_jsapi_bindings(build_dir: &Path) {
 
     builder = builder.clang_args(["-x", "c++"]);
 
-    let target = env::var("TARGET").unwrap();
-    if target.contains("windows") {
-        builder = builder.clang_arg("-fms-compatibility");
-    }
-
     if let Ok(flags) = env::var("CXXFLAGS") {
         for flag in flags.split_whitespace() {
             builder = builder.clang_arg(flag);
@@ -354,21 +358,16 @@ fn build_jsapi_bindings(build_dir: &Path) {
         }
     }
 
-    builder = builder.clang_args(cc_flags(true));
+    builder = builder.clang_args(cc_flags(target, true));
 
-    builder = builder.clang_args(["-I", build_dir.join("dist/include").to_str().expect("UTF-8")])
-        .clang_args(["-I", build_dir.join("js/src").to_str().expect("UTF-8")]);
-
-    let confdefs_path = build_dir.join("js/src/js-confdefs.h");
-    let confdefs = confdefs_path.to_str().expect("UTF-8");
+    builder = builder.clang_args(["-I", include_dir])
+        .clang_args(["-I", src_dir]);
 
     builder = if target.contains("windows") {
         builder.clang_arg("-DWIN32")
             .clang_arg(format!("-FI{}", confdefs))
     } else {
-        builder.clang_arg("-fPIC")
-            .clang_arg("-fno-rtti")
-            .clang_args(["-include", confdefs])
+        builder.clang_args(["-include", confdefs])
     };
 
     println!(
@@ -413,8 +412,9 @@ fn build_jsapi_bindings(build_dir: &Path) {
         .generate()
         .expect("Should generate JSAPI bindings OK");
 
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("build").join("jsapi.rs");
     bindings
-        .write_to_file(build_dir.join("jsapi.rs"))
+        .write_to_file(out_path)
         .expect("Should write bindings to file OK");
 }
 
@@ -488,28 +488,6 @@ const BLACKLIST_FUNCTIONS: &'static [&'static str] = &[
     "std::.*",
 ];
 
-/// Types that should be treated as an opaque blob of bytes whenever they show
-/// up within a whitelisted type.
-///
-/// These are types which are too tricky for bindgen to handle, and/or use C++
-/// features that don't have an equivalent in rust, such as partial template
-/// specialization.
-const OPAQUE_TYPES: &'static [&'static str] = &[
-    "JS::Auto.*Impl",
-    "JS::StackGCVector.*",
-    "JS::PersistentRooted.*",
-    "JS::detail::CallArgsBase.*",
-    "js::detail::UniqueSelector.*",
-    "mozilla::BufferList",
-    "mozilla::Maybe.*",
-    "mozilla::UniquePtr.*",
-    "mozilla::Variant",
-    "mozilla::Hash.*",
-    "mozilla::detail::Hash.*",
-    "RefPtr_Proxy.*",
-    "std::.*",
-];
-
 /// Types for which we should NEVER generate bindings, even if it is used within
 /// a type or function signature that we are generating bindings for.
 const BLACKLIST_TYPES: &'static [&'static str] = &[
@@ -533,6 +511,28 @@ const BLACKLIST_TYPES: &'static [&'static str] = &[
     "JS::dbg::Builder_Object",
     "JS::dbg::Builder_Object_Base",
     "JS::dbg::BuilderOrigin",
+];
+
+/// Types that should be treated as an opaque blob of bytes whenever they show
+/// up within a whitelisted type.
+///
+/// These are types which are too tricky for bindgen to handle, and/or use C++
+/// features that don't have an equivalent in rust, such as partial template
+/// specialization.
+const OPAQUE_TYPES: &'static [&'static str] = &[
+    "JS::Auto.*Impl",
+    "JS::StackGCVector.*",
+    "JS::PersistentRooted.*",
+    "JS::detail::CallArgsBase.*",
+    "js::detail::UniqueSelector.*",
+    "mozilla::BufferList",
+    "mozilla::Maybe.*",
+    "mozilla::UniquePtr.*",
+    "mozilla::Variant",
+    "mozilla::Hash.*",
+    "mozilla::detail::Hash.*",
+    "RefPtr_Proxy.*",
+    "std::.*",
 ];
 
 /// Definitions for types that were blacklisted

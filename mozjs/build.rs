@@ -5,30 +5,50 @@
 use std::env;
 use std::path::PathBuf;
 
-fn cc_flags(bindgen: bool) -> Vec<&'static str> {
-    let mut result = vec!["-DSTATIC_JS_API"];
+fn main() {
+    let outdir = PathBuf::from(env::var("DEP_MOZJS_OUTDIR").unwrap());
+
+    let include_dir = outdir.join("dist/include");
+    let confdefs_path = outdir.join("js/src/js-confdefs.h");
+
+    let include_dir = include_dir.to_str().expect("UTF-8");
+    let confdefs = confdefs_path.to_str().expect("UTF-8");
 
     let target = env::var("TARGET").unwrap();
+
+    build_jsglue(include_dir, confdefs, &target);
+    build_jsglue_bindings(include_dir, confdefs, &target);
+}
+
+fn cc_flags(target: &str, bindgen: bool) -> Vec<&'static str> {
+    let mut result = vec!["-DSTATIC_JS_API"];
+
     let windows = target.contains("windows");
+    let msvc = windows && !bindgen;
 
     if env::var("CARGO_FEATURE_DEBUGMOZJS").is_ok() {
         result.push("-DDEBUG");
 
-        // bindgen doesn't like this
-        if !bindgen {
-            if windows {
-                result.push("-Od");
-            } else {
-                result.push("-g");
-                result.push("-O0");
-            }
+        if msvc {
+            result.push("-Od");
+        } else {
+            result.push("-g");
+            result.push("-O0");
         }
     }
 
-    if windows && !bindgen {
+    if msvc {
         result.push("-std:c++17");
+        result.push("-Zi");
+        result.push("-GR-");
     } else {
         result.push("-std=c++17");
+        result.push("-fno-rtti");
+
+        if !windows {
+            result.push("-fms-compatibility");
+            result.push("-fPIC");
+        }
     }
 
     if env::var("CARGO_FEATURE_PROFILEMOZJS").is_ok() {
@@ -43,37 +63,28 @@ fn cc_flags(bindgen: bool) -> Vec<&'static str> {
     result
 }
 
-fn main() {
+fn build_jsglue(include_dir: &str, confdefs: &str, target: &str) {
     let mut build = cc::Build::new();
     build.cpp(true).file("src/jsglue.cpp");
 
-    let outdir = PathBuf::from(env::var("DEP_MOZJS_OUTDIR").unwrap());
+    build.include(include_dir);
 
-    build.include(outdir.join("dist/include"));
-
-    for flag in cc_flags(false) {
+    for flag in cc_flags(target, false) {
         build.flag_if_supported(flag);
     }
 
-    let confdefs_path = outdir.join("js/src/js-confdefs.h");
-    let confdefs = confdefs_path.to_str().expect("UTF-8");
-
     if build.get_compiler().is_like_msvc() {
         build.define("WIN32", "");
-        build.flag("-Zi");
-        build.flag("-GR-");
         build.flag(&format!("-FI{}", confdefs));
-        true
     } else {
-        build.flag("-fPIC");
-        build.flag("-fno-rtti");
         build.flag("-include");
         build.flag(confdefs);
-        false
     };
 
     build.compile("jsglue");
+}
 
+fn build_jsglue_bindings(include_dir: &str, confdefs: &str, target: &str) {
     println!("cargo:rerun-if-changed=src/jsglue.cpp");
     let mut builder = bindgen::Builder::default()
         .header("./src/jsglue.cpp")
@@ -84,22 +95,14 @@ fn main() {
 
     builder = builder.clang_args(["-x", "c++"]);
 
-    let target = env::var("TARGET").unwrap();
-    if target.contains("windows") {
-        builder = builder.clang_arg("-fms-compatibility");
-    }
+    builder = builder.clang_args(cc_flags(target, true));
 
-    builder = builder.clang_args(cc_flags(true));
-
-    builder = builder.clang_args(["-I", &outdir.join("dist/include").to_str().expect("UTF-8")]);
-
+    builder = builder.clang_args(["-I", include_dir]);
     builder = if target.contains("windows") {
         builder.clang_arg("-DWIN32")
             .clang_arg(format!("-FI{}", confdefs))
     } else {
-        builder.clang_arg("-fPIC")
-            .clang_arg("-fno-rtti")
-            .clang_args(["-include", confdefs])
+        builder.clang_args(["-include", confdefs])
     };
 
     for ty in BLACKLIST_TYPES {
